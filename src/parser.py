@@ -98,14 +98,16 @@ class Parser:
         encoding_id = self.db.insert_encoding( self.encoding );
         file_id = self.db.insert_file( filepath, encoding_id );
         
-        # Read and decode file in chunks
-        if use_stdin:
+        # Use streaming parser for gzip files
+        if self.encoding == 'gzip' or self.encoding == 'gz':
+            print( "Using streaming parser for gzip..." );
+            self._parse_streaming_gzip( filepath );
+        elif use_stdin:
             decoded_data = self._read_and_decode_stdin();
+            self._parse_records( decoded_data );
         else:
             decoded_data = self._read_and_decode_file( filepath );
-        
-        # Parse records and tokenize
-        self._parse_records( decoded_data );
+            self._parse_records( decoded_data );
         
         self.db.commit();
         
@@ -224,3 +226,90 @@ class Parser:
         
         # Filter out empty strings and return
         return [ t for t in tokens if t ];
+    
+    def _parse_streaming_gzip( self, filepath: str ) -> None:
+        """Parse gzip file using streaming to minimize memory usage."""
+        import gzip;
+        
+        print( "Reading and parsing in streaming mode..." );
+        
+        current_pos = 0;
+        record_count = 0;
+        batch_size = 1000;
+        buffer = "";
+        
+        # Open gzip file for streaming read
+        with gzip.open( filepath, 'rt', encoding='utf-8', errors='ignore' ) as f:
+            while True:
+                # Read chunk
+                chunk = f.read( self.chunk_size );
+                if not chunk:
+                    break;
+                
+                # Add to buffer
+                buffer += chunk;
+                
+                # Process complete records from buffer
+                # Handle escaped newline and tab separators
+                if self.separator == r'\n' or self.separator == '\\n':
+                    sep = '\n';
+                elif self.separator == r'\t' or self.separator == '\\t':
+                    sep = '\t';
+                else:
+                    sep = self.separator;
+                
+                # Split buffer by separator
+                parts = buffer.split( sep );
+                
+                # Keep last incomplete part in buffer
+                buffer = parts[ -1 ];
+                complete_records = parts[ :-1 ];
+                
+                # Process complete records
+                for record_text in complete_records:
+                    if not record_text.strip():
+                        current_pos += len( record_text.encode( 'utf-8', errors='ignore' ) ) + 1;
+                        continue;
+                    
+                    # Calculate positions
+                    record_bytes = record_text.encode( 'utf-8', errors='ignore' );
+                    start_pos = current_pos;
+                    end_pos = current_pos + len( record_bytes );
+                    current_pos = end_pos + 1;  # +1 for separator
+                    
+                    # Insert record
+                    record_id = self.db.insert_record( start_pos, end_pos );
+                    
+                    # Tokenize record
+                    tokens = self._tokenize( record_text );
+                    
+                    # Insert tokens and occurrences
+                    for token in tokens:
+                        if token:
+                            token_id = self.db.insert_token( token.lower() );
+                            self.db.insert_token_occurrence( token_id, record_id );
+                    
+                    record_count += 1;
+                    
+                    # Commit in batches
+                    if record_count % batch_size == 0:
+                        self.db.commit();
+                        print( f"  Processed {record_count} records...", end='\r' );
+            
+            # Process final buffer if not empty
+            if buffer.strip():
+                record_bytes = buffer.encode( 'utf-8', errors='ignore' );
+                start_pos = current_pos;
+                end_pos = current_pos + len( record_bytes );
+                
+                record_id = self.db.insert_record( start_pos, end_pos );
+                tokens = self._tokenize( buffer );
+                
+                for token in tokens:
+                    if token:
+                        token_id = self.db.insert_token( token.lower() );
+                        self.db.insert_token_occurrence( token_id, record_id );
+                
+                record_count += 1;
+        
+        print( f"  Processed {record_count} records...done" );
